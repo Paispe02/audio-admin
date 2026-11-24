@@ -6,22 +6,19 @@ procesan localmente con ffmpeg/ffprobe.
 """
 from __future__ import annotations
 
-import cgi
-import hashlib
 import json
-import mimetypes
 import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 import uuid
 import zipfile
-from http import HTTPStatus
+from email.parser import BytesParser
+from email.policy import HTTP
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / ".audio-admin"
@@ -115,7 +112,7 @@ def safe_name(name):
 def optimize_cover(upload, name):
     base = COVERS / f"{uuid.uuid4().hex}.jpg"
     raw = COVERS / f"raw-{uuid.uuid4().hex}{Path(name).suffix.lower() or '.img'}"
-    with open(raw, "wb") as out: shutil.copyfileobj(upload, out)
+    raw.write_bytes(upload)
     process = run(["ffmpeg", "-y", "-i", str(raw), "-vf", "scale=1400:1400:force_original_aspect_ratio=decrease,pad=1400:1400:(ow-iw)/2:(oh-ih)/2:color=white", "-frames:v", "1", "-q:v", "3", str(base)])
     raw.unlink(missing_ok=True)
     if process.returncode:
@@ -151,9 +148,21 @@ class Handler(SimpleHTTPRequestHandler):
     def send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", len(body)); self.end_headers(); self.wfile.write(body)
+    def local_request(self):
+        """Solo acepta esta misma página: otra web abierta en el navegador no puede usar la API."""
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        return host.split(":")[0] in {"127.0.0.1", "localhost"} and origin in {None, f"http://{host}"}
+    def read_files(self, field):
+        # shortcut: el envío completo se lee en memoria; pasar a ficheros temporales si se suben lotes de varios GB.
+        head = f"Content-Type: {self.headers.get('Content-Type', '')}\r\n\r\n".encode()
+        form = BytesParser(policy=HTTP).parsebytes(head + self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        parts = form.iter_parts() if form.is_multipart() else []
+        return [(p.get_filename(), p.get_payload(decode=True)) for p in parts if p.get_param("name", header="content-disposition") == field and p.get_filename()]
     def read_json(self):
         return json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
     def do_GET(self):
+        if not self.local_request(): return self.send_json({"error": "Origen no permitido"}, 403)
         parsed = urlparse(self.path)
         if parsed.path == "/api/tracks":
             state = load_state(); tracks = []
@@ -178,24 +187,22 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_response(200); self.send_header("Content-Type", "application/zip"); self.send_header("Content-Disposition", f'attachment; filename="{path.name}"'); self.send_header("Content-Length", path.stat().st_size); self.end_headers(); return self.wfile.write(path.read_bytes())
         return super().do_GET()
     def do_POST(self):
+        if not self.local_request(): return self.send_json({"error": "Origen no permitido"}, 403)
         path = urlparse(self.path).path
         try:
             if path in {"/api/import", "/api/cover"}:
-                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type", "")})
                 if path == "/api/import":
-                    files = form["files"] if "files" in form else []
-                    if not isinstance(files, list): files = [files]
                     state, added = load_state(), []
-                    for upload in files:
-                        if not getattr(upload, "filename", None) or Path(upload.filename).suffix.lower() not in ALLOWED_AUDIO: continue
-                        ident = uuid.uuid4().hex; filename = safe_name(Path(upload.filename).name); dest = IMPORTS / f"{ident}{Path(filename).suffix.lower()}"
-                        with open(dest, "wb") as out: shutil.copyfileobj(upload.file, out)
+                    for name, data in self.read_files("files"):
+                        if Path(name).suffix.lower() not in ALLOWED_AUDIO: continue
+                        ident = uuid.uuid4().hex; filename = safe_name(Path(name).name); dest = IMPORTS / f"{ident}{Path(filename).suffix.lower()}"
+                        dest.write_bytes(data)
                         state["tracks"][ident] = {"id": ident, "filename": filename, "source": str(dest), "origin": str(dest), "managed_copy": True, "changes": {}}; added.append(ident)
                     save_state(state); return self.send_json({"added": added})
-                upload = form["cover"]
-                if not getattr(upload, "filename", None): raise ValueError("Selecciona una imagen.")
-                cover = optimize_cover(upload.file, upload.filename)
-                return self.send_json({"cover": Path(cover).name})
+                uploads = self.read_files("cover")
+                if not uploads: raise ValueError("Selecciona una imagen.")
+                name, data = uploads[0]
+                return self.send_json({"cover": Path(optimize_cover(data, name)).name})
             payload, state = self.read_json(), load_state()
             ids = [x for x in payload.get("ids", []) if x in state["tracks"]]
             if path in {"/api/pick-files", "/api/pick-folder"}:
@@ -238,6 +245,8 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as error: self.send_json({"error": "Error inesperado: " + str(error)}, 500)
 
 def main():
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if not shutil.which(tool)]
+    if missing: raise SystemExit("Falta " + " y ".join(missing) + ". Instálalo con: brew install ffmpeg")
     ensure_data()
     port = int(os.environ.get("AUDIO_ADMIN_PORT", "8060"))
     print(f"Audio Admin listo en http://127.0.0.1:{port}")
